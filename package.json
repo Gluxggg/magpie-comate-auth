@@ -1,0 +1,34 @@
+{
+  "name": "magpie-comate-auth",
+  "version": "0.1.0",
+  "description": "文心快码 Baidu Comate account card for magpie: membership, seat points, add-on and gift points",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "icon.png",
+    "README.md"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "comate",
+    "baidu",
+    "wenxin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ikashana/magpie-comate-auth.git"
+  },
+  "homepage": "https://github.com/ikashana/magpie-comate-auth#readme",
+  "bugs": {
+    "url": "https://github.com/ikashana/magpie-comate-auth/issues"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@comate/zulu": "1.7.21"
+  }
+}
