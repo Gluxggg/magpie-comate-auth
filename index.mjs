@@ -341,15 +341,43 @@ function toQuery(messages) {
   return parts.join("\n\n")
 }
 
+// Windows 的 CreateProcess 命令行上限约 32k 字符，Hermes 一轮带完整历史很容易顶破，
+// 所以长上下文不走 -q，写成文件用 --attach-file 传（Ask 模式能读附件，实测有效）。
+const MAX_QUERY_CHARS = 8000
+
 function runZulu(query, modelLabel, { cid, images = [], timeoutMs = 240000 } = {}) {
   return new Promise((resolvePromise, reject) => {
     const cli = zuluCli()
     if (!existsSync(cli)) {
       return reject(new Error("zulu CLI 没装：node_modules/@comate/zulu 不存在，先在插件目录 npm i @comate/zulu"))
     }
-    const args = [cli, "run", "-q", query, "-m", modelLabel, "--mode", "Ask", "-d", "delta-stream"]
+    const args = [cli, "run", "-m", modelLabel, "--mode", "Ask", "-d", "delta-stream"]
     if (cid) args.push("-c", cid) // 复用会话：只发增量，服务端自己有历史
     for (const img of images) args.push("--attach-image", img)
+
+    let ctxFile = ""
+    if (query.length > MAX_QUERY_CHARS) {
+      try {
+        ctxFile = join(imageDir(), `ctx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`)
+        writeFileSync(ctxFile, query, "utf8")
+        args.push("-q", "请阅读附加的文件，按其中最后提出的要求回答。")
+        args.push("--attach-file", ctxFile)
+      } catch {
+        ctxFile = ""
+        args.push("-q", query.slice(0, MAX_QUERY_CHARS))
+      }
+    } else {
+      args.push("-q", query)
+    }
+
+    const cleanup = () => {
+      if (!ctxFile) return
+      try {
+        unlinkSync(ctxFile)
+      } catch {}
+      ctxFile = ""
+    }
+
     const child = spawn(findNode(), args, {
       env: { ...process.env, HTTP_HOST: BASE },
       windowsHide: true,
@@ -364,6 +392,7 @@ function runZulu(query, modelLabel, { cid, images = [], timeoutMs = 240000 } = {
       try {
         child.kill()
       } catch {}
+      cleanup()
       reject(new Error(`zulu 超时（${Math.round(timeoutMs / 1000)} 秒）`))
     }, timeoutMs)
 
@@ -373,12 +402,14 @@ function runZulu(query, modelLabel, { cid, images = [], timeoutMs = 240000 } = {
       if (done) return
       done = true
       clearTimeout(timer)
+      cleanup()
       reject(e)
     })
     child.on("close", () => {
       if (done) return
       done = true
       clearTimeout(timer)
+      cleanup()
       let content = ""
       let status = ""
       let lastErr = ""
