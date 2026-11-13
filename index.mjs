@@ -354,12 +354,57 @@ async function apiPost(license, path, body, { timeoutMs = 60000 } = {}) {
   return j ?? {}
 }
 
+const mimeOf = (p) => {
+  const e = String(p).split(".").pop().toLowerCase()
+  if (e === "jpg" || e === "jpeg") return "image/jpeg"
+  if (e === "webp") return "image/webp"
+  if (e === "gif") return "image/gif"
+  return "image/png"
+}
+
+// 图片要先上传换 file id，execute 时靠 contexts[type=IMAGE] 引用。
+async function uploadImage(license, filePath) {
+  const buf = readFileSync(filePath)
+  const mime = mimeOf(filePath)
+  const name = String(filePath).split(/[\\/]/).pop() || "image.png"
+  const r = await apiPost(
+    license,
+    "/api/aidevops/autocomate/rest/autowork/v1/file/upload",
+    { fileName: name, contentType: mime, scene: "Composer", fileData: `data:${mime};base64,${buf.toString("base64")}` },
+    { timeoutMs: 120000 },
+  )
+  return { id: r?.data?.id, name }
+}
+
 // 一轮对话：建会话（或复用）→ 建任务 → execute；边收 SSE 边把增量交给 onDelta。
-async function callComate({ question, history, model, conversationId, onDelta, timeoutMs = 300000 }) {
+async function callComate({ question, history, model, conversationId, images = [], onDelta, timeoutMs = 300000 }) {
   const auth = readMagpieCookies()
   if (!auth?.cookies?.length) throw new Error("没有百度 cookie：先 `magpie plugin login comate` 登录一次")
   const license = await getLicense(buildCookieHeader(auth.cookies))
   const base = apiBase(license)
+
+  // 图片：先上传拿 id，再在 contexts 里引用
+  const contexts = []
+  if (images.length && model.vision) {
+    const uploaded = []
+    for (const p of images) {
+      try {
+        const u = await uploadImage(license, p)
+        if (u?.id) uploaded.push(u)
+      } catch {}
+    }
+    if (uploaded.length) {
+      contexts.push({
+        type: "IMAGE",
+        imageIds: uploaded.map((u) => u.id),
+        images: uploaded.map((u) => ({
+          id: u.id,
+          name: u.name,
+          url: `${BASE}/api/aidevops/autocomate/rest/autowork/v1/file/stream/${u.id}?authorization=${license}`,
+        })),
+      })
+    }
+  }
 
   let cid = conversationId
   if (!cid) {
@@ -407,7 +452,7 @@ async function callComate({ question, history, model, conversationId, onDelta, t
       query,
       modelKey: model.modelId,
       toolUseResults: [],
-      contexts: [],
+      contexts,
       subAgents: [],
       sysInfo: {
         os: "Windows 10",
@@ -669,6 +714,7 @@ async function proxyHandler(req, res) {
               history: askHistory,
               model,
               conversationId: cid,
+              images,
               onDelta: (d) => res.write(chunk({ content: d })),
             })
             rememberReply(text, newCid, sessionKey)
@@ -682,6 +728,7 @@ async function proxyHandler(req, res) {
             history: askHistory,
             model,
             conversationId: cid,
+            images,
           })
           rememberReply(text, newCid, sessionKey)
           dropImages(images)

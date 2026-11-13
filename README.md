@@ -84,7 +84,7 @@ magpie ──OpenAI 格式──▶ 127.0.0.1:3427（插件内）──▶ Comat
 - `modelKey` 是服务端的完整模型 ID（`<type>_<hash>`），随服务端版本变；对不上时重跑一次 `zulu list-model` 更新。
 - `tool_call: false`：接口只暴露 Ask（纯问答），agent 能力不映射成 OpenAI tools 协议。
 - 会话映射存在内存里（最多 300 条，LRU），magpie 重启后旧会话接不上，会当新会话处理。
-- **图片**：暂未接入（`contexts` 字段的图片格式未验证），视觉模型目前按纯文本处理。
+- **图片**：视觉模型支持。`image_url`（data URL）先 `POST /autowork/v1/file/upload`（body 是 `{fileName, contentType, scene:"Composer", fileData:"data:...;base64,..."}`）换 file id，再在 execute 的 `contexts[type=IMAGE]` 里引用 `imageIds` + `images[{id,name,url}]`。实测 1.9 秒正确识别。
 
 > 早期版本走的是官方 CLI `@comate/zulu`（`zulu run --mode Ask`），每轮 spawn 一个进程，
 > 慢 4~11 秒，还受 Windows 32k 命令行上限和附件语义困扰。2026-11 换成上面的直连实现后这些问题都没有了。
