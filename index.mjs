@@ -4,16 +4,22 @@
 // Comate 这边（comate.baidu.com 个人中心的「席位积分」）。搭子自己的配额接口看不到
 // 这份积分，所以在 magpie 里加一个 Comate 账号卡片，才能看见会员那 25,000 分。
 //
-// Comate 没有公开的 OpenAI 兼容 API，但官方 CLI（@comate/zulu）能跑 Ask 模式，
-// 所以插件自己起一个 127.0.0.1 上的兼容口，把 /v1/chat/completions 翻译成 `zulu run`。
-// 服务随插件生命周期起落，删插件即消失；没装 CLI 时自动退化成纯额度卡片。
+// 模型通道走的是 Comate 插件那套真实 HTTP API（不是 zulu CLI）：
+//   GET  /api/key/valid/<license>                       验票
+//   POST /autowork/v2/conversation   → conversationId    建会话
+//   POST /autowork/v2/task           → taskId            建任务
+//   POST /autowork/v2/execute        → SSE（ANSWER.delta）执行
+// 认证只需要把 license 放进 login-name 头，没有签名 / 设备绑定，所以不需要起进程。
+// 插件自己起一个 127.0.0.1 上的 OpenAI 兼容口，把这些接口翻译成 /v1/chat/completions。
+// 服务随插件生命周期起落，删插件即消失。
 //
 // 本插件只读 magpie 的凭据：不写 magpie 的配置，只写一份用量缓存（comate-usage-cache.json）。
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs"
 import { createServer } from "node:http"
-import { spawn } from "node:child_process"
 import { dirname, join, resolve } from "node:path"
+import { randomUUID } from "node:crypto"
+import { homedir } from "node:os"
 
 const PROVIDER_ID = "comate"
 const PROVIDER_NAME = "文心快码 Comate"
@@ -258,23 +264,24 @@ const pluginIcon = await loadIcon()
 
 const PROXY_PORT = Number(process.env.COMATE_PROXY_PORT ?? 3427)
 
-// 实测自 `zulu list-model`。label 是传给 -m 的显示名。
+// modelId 是 Comate 服务端认的完整 key（<type>_<hash>），从 `zulu list-model` 取一次，
+// 会随服务端版本变；对不上时用 modelType 前缀兜底，再不行就报错让用户重跑 list-model。
 const MODELS = [
-  { id: "deepseek-v4-flash", label: "Deepseek V4 Flash", vision: false },
-  { id: "deepseek-v4-pro", label: "Deepseek V4 Pro", vision: false },
-  { id: "deepseek-v4.1-flash", label: "Deepseek V4.1 Flash", vision: true, effort: ["low", "high", "max"] },
-  { id: "ernie-5.5-flash-preview", label: "ERNIE 5.5 Flash Preview", vision: true },
-  { id: "glm-4.7-fc", label: "GLM-4.7", vision: false },
-  { id: "glm-5-turbo-fc", label: "GLM-5-Turbo", vision: false },
-  { id: "glm-5.1", label: "GLM-5.1", vision: false },
-  { id: "glm-5.2", label: "GLM-5.2", vision: false },
-  { id: "glm-5.3", label: "GLM-5.3", vision: false, effort: ["low", "high", "max"] },
-  { id: "glm-5.3-flash", label: "GLM-5.3-Flash", vision: true },
-  { id: "glm-5v-turbo", label: "GLM-5v-Turbo", vision: true },
-  { id: "kimi-k2.6-oneapi", label: "Kimi-K2.6", vision: true },
-  { id: "minimax-m2.5-fc", label: "MiniMax M2.5", vision: false },
-  { id: "minimax-m3", label: "MiniMax M3", vision: true },
-  { id: "minimax-m2.7-fc", label: "MiniMax-M2.7", vision: false },
+  { id: "deepseek-v4-flash", modelId: "deepseek-v4-flash_a8668ea86c3d40e7ad1f8ee45715d447", label: "Deepseek V4 Flash", vision: false },
+  { id: "deepseek-v4-pro", modelId: "deepseek-v4-pro_4ba5277b630243be9eeb19fe48f853fa", label: "Deepseek V4 Pro", vision: false },
+  { id: "deepseek-v4.1-flash", modelId: "deepseek-v4.1-flash_4827e158760447029e6594bb2b1ab066", label: "Deepseek V4.1 Flash", vision: true, effort: ["low", "high", "max"] },
+  { id: "ernie-5.5-flash-preview", modelId: "ernie-5.5-flash-preview_996d9d76bb7c45ecbff286216aaeeab2", label: "ERNIE 5.5 Flash Preview", vision: true },
+  { id: "glm-4.7-fc", modelId: "glm-4.7-fc_0b87452a03394418b5c8d5468deff6c7", label: "GLM-4.7", vision: false },
+  { id: "glm-5-turbo-fc", modelId: "glm-5-turbo-fc_6748c832242b4bcb8f715c7c7902d1ad", label: "GLM-5-Turbo", vision: false },
+  { id: "glm-5.1", modelId: "glm-5.1_a231cc317baf4eaaa0b5afdd4de5f1d9", label: "GLM-5.1", vision: false },
+  { id: "glm-5.2", modelId: "glm-5.2_50c584482e9d47edbbe47938a88b56b1", label: "GLM-5.2", vision: false },
+  { id: "glm-5.3", modelId: "glm-5.3_37c550fc6d5b4fb2825abc2c1c88a6b3", label: "GLM-5.3", vision: false, effort: ["low", "high", "max"] },
+  { id: "glm-5.3-flash", modelId: "glm-5.3-flash_805131a9381a4940ba0f2d90cad0e7eb", label: "GLM-5.3-Flash", vision: true },
+  { id: "glm-5v-turbo", modelId: "glm-5v-turbo_ea9e4f222f0a40b281953ebcb6981dda", label: "GLM-5v-Turbo", vision: true },
+  { id: "kimi-k2.6-oneapi", modelId: "kimi-k2.6-oneapi_123e4567e89b12d3a456426614174000", label: "Kimi-K2.6", vision: true },
+  { id: "minimax-m2.5-fc", modelId: "minimax-m2.5-fc_c99ea14f526548a8bc28717d4e854123", label: "MiniMax M2.5", vision: false },
+  { id: "minimax-m3", modelId: "minimax-m3_a8f465fbedb942efadace88370ad7ff1", label: "MiniMax M3", vision: true },
+  { id: "minimax-m2.7-fc", modelId: "minimax-m2.7-fc_047f123f661c414bb253c05b605c391e", label: "MiniMax-M2.7", vision: false },
 ]
 
 const modelOf = (name) => MODELS.find((m) => m.id === name || m.label === name) ?? MODELS[0]
@@ -303,29 +310,170 @@ function selfDir() {
   }
 }
 
-// magpie 自己是 Bun 编译的 exe，process.execPath 指不到 node，得自己找。
-// 只按环境变量 / PATH / 常见安装位置找，不写死任何机器路径。
-function findNode() {
-  const isWin = process.platform === "win32"
-  const exe = isWin ? "node.exe" : "node"
-  const cands = [process.env.COMATE_NODE]
-  // 如果插件是被 node 加载的（开发/测试），直接用同一个 node
-  if (process.execPath && !/magpie/i.test(process.execPath)) cands.push(process.execPath)
-  for (const dir of String(process.env.PATH ?? "").split(isWin ? ";" : ":")) {
-    if (dir.trim()) cands.push(join(dir.trim(), exe))
-  }
-  cands.push(join(process.env.LOCALAPPDATA ?? "", "Programs", "nodejs", exe))
-  cands.push(isWin ? "C:/Program Files/nodejs/node.exe" : "/usr/local/bin/node")
-  for (const c of cands) {
-    try {
-      if (c && existsSync(c)) return c
-    } catch {}
-  }
-  return exe
+// ── Comate 真实 HTTP API ──────────────────────────────────────────
+// 认证只要把 license 放进 login-name / Uuap-login-name 头，没有签名、没有设备绑定，
+// 所以不需要像 CLI 那样每次 spawn 一个进程。实测单轮 1.4 秒、1 万字长文 2.0 秒。
+const API_HEADERS = (license) => ({
+  Accept: "application/json, text/plain, */*",
+  "Content-Type": "application/json",
+  "login-name": license,
+  "Uuap-login-name": license,
+  "X-Source": "COMATE",
+  "plugin-version": "zulucli-4.13.0",
+  "x-skip-fcnap": "yes",
+  "Accept-Language": "zh-CN,zh",
+  "User-Agent": "axios/1.16.1",
+})
+const apiBase = (license) => ({ username: license, ide: "zulucli", ideVersion: "1.7.21", pluginVersion: "4.13.0" })
+
+let licenseCache = { value: "", at: 0 }
+
+// license 就是 /api/user 返回的那串 UUID，和额度卡片共用同一份 cookie。
+async function getLicense(cookieHeader) {
+  if (licenseCache.value && Date.now() - licenseCache.at < 3600_000) return licenseCache.value
+  const data = await getJsonOnce("/api/user", cookieHeader, 15000)
+  const lic = data?.license ?? data?.data?.license ?? ""
+  if (!lic) throw new Error("拿不到 license（/api/user 没有返回 license 字段）")
+  licenseCache = { value: lic, at: Date.now() }
+  return lic
 }
 
-function zuluCli() {
-  return join(selfDir(), "node_modules", "@comate", "zulu", "bin", "cli.mjs")
+async function apiPost(license, path, body, { timeoutMs = 60000 } = {}) {
+  const r = await fetch(BASE + path, {
+    method: "POST",
+    headers: { ...API_HEADERS(license), "X-Trace-Id": randomUUID() },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  const text = await r.text()
+  let j = null
+  try {
+    j = JSON.parse(text)
+  } catch {}
+  if (!r.ok) throw new Error(`${path} ${r.status} ${text.slice(0, 160)}`)
+  return j ?? {}
+}
+
+// 一轮对话：建会话（或复用）→ 建任务 → execute；边收 SSE 边把增量交给 onDelta。
+async function callComate({ question, history, model, conversationId, onDelta, timeoutMs = 300000 }) {
+  const auth = readMagpieCookies()
+  if (!auth?.cookies?.length) throw new Error("没有百度 cookie：先 `magpie plugin login comate` 登录一次")
+  const license = await getLicense(buildCookieHeader(auth.cookies))
+  const base = apiBase(license)
+
+  let cid = conversationId
+  if (!cid) {
+    const conv = await apiPost(license, "/api/aidevops/autocomate/rest/autowork/v2/conversation", { agentId: 8, ...base })
+    cid = conv?.data?.id
+    if (!cid) throw new Error(`建会话失败：${JSON.stringify(conv).slice(0, 200)}`)
+  }
+
+  const taskId = (
+    await apiPost(license, "/api/aidevops/autocomate/rest/autowork/v2/task", {
+      agentInfo: { isProjectAgent: false, agentName: "Ask", canInvokeAgents: false },
+      agentId: 8,
+      conversationId: cid,
+      signal: {},
+      ...base,
+    })
+  )?.data?.taskId
+  if (!taskId) throw new Error("建任务失败：没拿到 taskId")
+
+  const query = history ? `${history}\n\n用户：${question}` : question
+  const r = await fetch(BASE + "/api/aidevops/autocomate/rest/autowork/v2/execute", {
+    method: "POST",
+    headers: { ...API_HEADERS(license), Accept: "text/event-stream", "X-Trace-Id": randomUUID() },
+    body: JSON.stringify({
+      ...base,
+      taskId,
+      conversationId: cid,
+      agentId: 8,
+      uploadBaseInfo: {
+        os: "Windows 10",
+        osVersion: "Windows 10",
+        extName: "zulucli",
+        extVersion: "4.13.0",
+        ideType: "zulucli",
+        ideName: "zulucli",
+        ideVersion: "1.7.21",
+        vcsRepo: "",
+        vcsBranchName: "",
+        username: license,
+        license,
+        pluginVersion: "4.13.0",
+        device: randomUUID(),
+        triggerSource: "Agent",
+      },
+      query,
+      modelKey: model.modelId,
+      toolUseResults: [],
+      contexts: [],
+      subAgents: [],
+      sysInfo: {
+        os: "Windows 10",
+        defaultShell: "cmd.exe",
+        homeDir: homedir(),
+        installedCommands: [],
+        notInstalledCommands: [],
+        workspacePath: process.cwd(),
+        workspaceRoots: [process.cwd()],
+      },
+      skillInfos: [],
+      hasMcp: false,
+      isUserQuery: true,
+      isMockQuery: false,
+      localIndex: false,
+      // 下面这几个字段看着没用，缺了模型会返回空内容——都是 zulu 真实请求里带的，
+      // 尤其 systemReminder 是 Ask 模式的系统提示，空了模型就不知道该干什么。
+      agentVersion: 12,
+      isFirstQuery: !conversationId,
+      enableMemory: true,
+      systemReminder:
+        "<system-reminder>\nAsk mode is active; only read-only tools are available.\nIf code edits are needed, output the proposed change as assistant text for the user to copy/apply.\n</system-reminder>",
+      extendUserQueryInfo: { commands: [], skills: [], subagents: [], rules: [] },
+      extend: { isMultiWorkspace: false, useWorkflow: false },
+      sendMode: "normal",
+      agentInfo: { agentName: "Ask", isProjectAgent: false, canInvokeAgents: false, isCustomAgent: false },
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  if (!r.ok) throw new Error(`execute ${r.status} ${(await r.text()).slice(0, 160)}`)
+
+  const reader = r.body.getReader()
+  const dec = new TextDecoder()
+  let buf = ""
+  let text = ""
+  let err = ""
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    const lines = buf.split("\n")
+    buf = lines.pop() ?? ""
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue
+      const raw = line.slice(6).trim()
+      if (!raw || raw === "[DONE]") continue
+      let j
+      try {
+        j = JSON.parse(raw)
+      } catch {
+        continue
+      }
+      const c = j.content
+      if (!c) continue
+      if (c.type === "EXCEPTION") err = c.detail?.exceptionMsg ?? c.text ?? "unknown"
+      if (c.type === "ANSWER") {
+        const d = c.detail?.delta ?? ""
+        if (d) {
+          text += d
+          onDelta?.(d)
+        }
+      }
+    }
+  }
+  if (err && !text) throw new Error(err)
+  return { text, cid }
 }
 
 // 把 OpenAI 的 messages 拼成 zulu 的单条 query。zulu 是 agent，不是多轮 chat API。
@@ -341,98 +489,24 @@ function toQuery(messages) {
   return parts.join("\n\n")
 }
 
-// Windows 的 CreateProcess 命令行上限约 32k 字符，Hermes 一轮带完整历史很容易顶破，
-// 所以长上下文不走 -q，写成文件用 --attach-file 传（Ask 模式能读附件，实测有效）。
-const MAX_QUERY_CHARS = 8000
-
-function runZulu(query, modelLabel, { cid, images = [], timeoutMs = 240000 } = {}) {
-  return new Promise((resolvePromise, reject) => {
-    const cli = zuluCli()
-    if (!existsSync(cli)) {
-      return reject(new Error("zulu CLI 没装：node_modules/@comate/zulu 不存在，先在插件目录 npm i @comate/zulu"))
+// 把「最后一条用户消息」和「之前的历史」拆开。问题本身要留在 -q 里，历史才进附件：
+// 反过来的话（元指令进 -q、问题塞附件），模型会把那句元指令当成用户说的话，
+// 回答里全是「文件最后一处要求是……因此最后提出的要求是……」这种复述。
+function splitQuery(messages) {
+  const list = Array.isArray(messages) ? messages : []
+  let lastUserIdx = -1
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i]?.role === "user") {
+      lastUserIdx = i
+      break
     }
-    const args = [cli, "run", "-m", modelLabel, "--mode", "Ask", "-d", "delta-stream"]
-    if (cid) args.push("-c", cid) // 复用会话：只发增量，服务端自己有历史
-    for (const img of images) args.push("--attach-image", img)
-
-    let ctxFile = ""
-    if (query.length > MAX_QUERY_CHARS) {
-      try {
-        ctxFile = join(imageDir(), `ctx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`)
-        writeFileSync(ctxFile, query, "utf8")
-        args.push("-q", "请阅读附加的文件，按其中最后提出的要求回答。")
-        args.push("--attach-file", ctxFile)
-      } catch {
-        ctxFile = ""
-        args.push("-q", query.slice(0, MAX_QUERY_CHARS))
-      }
-    } else {
-      args.push("-q", query)
-    }
-
-    const cleanup = () => {
-      if (!ctxFile) return
-      try {
-        unlinkSync(ctxFile)
-      } catch {}
-      ctxFile = ""
-    }
-
-    const child = spawn(findNode(), args, {
-      env: { ...process.env, HTTP_HOST: BASE },
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    })
-    let out = ""
-    let err = ""
-    let done = false
-    const timer = setTimeout(() => {
-      if (done) return
-      done = true
-      try {
-        child.kill()
-      } catch {}
-      cleanup()
-      reject(new Error(`zulu 超时（${Math.round(timeoutMs / 1000)} 秒）`))
-    }, timeoutMs)
-
-    child.stdout.on("data", (d) => (out += d))
-    child.stderr.on("data", (d) => (err += d))
-    child.on("error", (e) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      cleanup()
-      reject(e)
-    })
-    child.on("close", () => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      cleanup()
-      let content = ""
-      let status = ""
-      let lastErr = ""
-      let gotCid = ""
-      for (const line of out.split("\n")) {
-        const s = line.trim()
-        if (!s.startsWith("{")) continue
-        try {
-          const j = JSON.parse(s)
-          if (j.cid) gotCid = j.cid
-          if (j.kind === "element-add" && j.element?.type === "EXCEPTION") lastErr = j.element.content ?? ""
-          if (j.kind === "completed") {
-            content = j.content ?? ""
-            status = j.status ?? ""
-            if (j.cid) gotCid = j.cid
-          }
-        } catch {}
-      }
-      if (status === "ok") resolvePromise({ text: content, cid: gotCid })
-      else reject(new Error(content || lastErr || err.trim() || "zulu 没有返回内容"))
-    })
-  })
+  }
+  if (lastUserIdx < 0) return { question: "", history: toQuery(list) }
+  const question = textOf(list[lastUserIdx]).trim()
+  const history = toQuery(list.filter((_, i) => i !== lastUserIdx))
+  return { question, history }
 }
+
 
 function readJsonBody(req) {
   return new Promise((r) => {
@@ -537,13 +611,12 @@ function dropImages(files) {
   }
 }
 
-// 起本地 OpenAI 兼容口。端口固定，已被占用就认为别的 magpie 进程已经在服务了。
+// 起本地 OpenAI 兼容口。
 let proxyReady = null
-function startProxy() {
-  if (proxyReady) return proxyReady
-  proxyReady = new Promise((done) => {
-    const server = createServer(async (req, res) => {
-      const url = new URL(req.url ?? "/", "http://127.0.0.1")
+let proxyServer = null
+
+async function proxyHandler(req, res) {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1")
       const send = (code, body) => {
         res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" })
         res.end(JSON.stringify(body))
@@ -565,36 +638,53 @@ function startProxy() {
         // 续会话只发最后一句（历史在 zulu 那边），新会话才把 system + 历史拼成一条
         const sessionKey = explicitSession(body, req.headers)
         const cid = findCid(msgs, sessionKey)
-        const query = cid && lastUser ? textOf(lastUser) : toQuery(msgs)
-        if (!query) {
+        // 续会话只发最后一句（历史在服务端）；新会话把历史带上，长的话 runZulu 会转成附件
+        const { question, history } = splitQuery(msgs)
+        const askQuestion = cid ? (lastUser ? textOf(lastUser).trim() : question) : question
+        const askHistory = cid ? "" : history
+        if (!askQuestion && !askHistory) {
           dropImages(images)
           return send(400, { error: { message: "messages 是空的", type: "invalid_request_error" } })
         }
+        const id = "chatcmpl-" + Date.now().toString(36)
+        const created = Math.floor(Date.now() / 1000)
+        const chunk = (delta, finish = null) =>
+          `data: ${JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: model.id,
+            choices: [{ index: 0, delta, finish_reason: finish }],
+          })}\n\n`
         try {
-          const { text, cid: newCid } = await runZulu(query, model.label, { cid, images })
-          rememberReply(text, newCid, sessionKey)
-          dropImages(images)
-          const id = "chatcmpl-" + Date.now().toString(36)
-          const created = Math.floor(Date.now() / 1000)
           if (body.stream) {
             res.writeHead(200, {
               "Content-Type": "text/event-stream; charset=utf-8",
               "Cache-Control": "no-store",
               Connection: "keep-alive",
             })
-            const chunk = (delta, finish = null) =>
-              `data: ${JSON.stringify({
-                id,
-                object: "chat.completion.chunk",
-                created,
-                model: model.id,
-                choices: [{ index: 0, delta, finish_reason: finish }],
-              })}\n\n`
-            res.write(chunk({ role: "assistant", content: text }))
+            res.write(chunk({ role: "assistant" }))
+            const { text, cid: newCid } = await callComate({
+              question: askQuestion,
+              history: askHistory,
+              model,
+              conversationId: cid,
+              onDelta: (d) => res.write(chunk({ content: d })),
+            })
+            rememberReply(text, newCid, sessionKey)
+            dropImages(images)
             res.write(chunk({}, "stop"))
             res.write("data: [DONE]\n\n")
             return res.end()
           }
+          const { text, cid: newCid } = await callComate({
+            question: askQuestion,
+            history: askHistory,
+            model,
+            conversationId: cid,
+          })
+          rememberReply(text, newCid, sessionKey)
+          dropImages(images)
           return send(200, {
             id,
             object: "chat.completion",
@@ -605,22 +695,62 @@ function startProxy() {
           })
         } catch (e) {
           dropImages(images)
-          return send(502, { error: { message: String(e?.message ?? e), type: "upstream_error" } })
+          const msg = String(e?.message ?? e)
+          // 流式已经发过头了，只能把错误塞进流里，不能再改状态码
+          if (res.headersSent) {
+            try {
+              res.write(chunk({}, "stop"))
+              res.write(`data: ${JSON.stringify({ error: { message: msg, type: "upstream_error" } })}\n\n`)
+              res.write("data: [DONE]\n\n")
+              return res.end()
+            } catch {}
+            return
+          }
+          return send(502, { error: { message: msg, type: "upstream_error" } })
         }
       }
 
       res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
       res.end("not found")
-    })
+      }
 
-    server.once("error", (e) => {
-      if (e?.code === "EADDRINUSE") return done(`http://127.0.0.1:${PROXY_PORT}/v1`) // 已有进程在服务
-      done("")
-    })
-    server.listen(PROXY_PORT, "127.0.0.1", () => done(`http://127.0.0.1:${PROXY_PORT}/v1`))
-  })
-  return proxyReady
-}
+      // 端口被占时不能盲目认定「已有实例在服务」：旧进程可能刚退出、端口已空，
+      // 那样 magpie 会一直 ECONNREFUSED。先探测，探不通就换随机端口。
+      function listenOn(port) {
+      return new Promise((resolve) => {
+        const server = createServer(proxyHandler)
+        server.once("error", (e) => resolve({ ok: false, code: e?.code }))
+        server.listen(port, "127.0.0.1", () => resolve({ ok: true, port: server.address().port, server }))
+      })
+      }
+
+      async function probeProxy(port) {
+      try {
+        const r = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(1500) })
+        return r.ok
+      } catch {
+        return false
+      }
+      }
+
+      async function startProxy() {
+      if (proxyReady) return proxyReady
+      proxyReady = (async () => {
+        const first = await listenOn(PROXY_PORT)
+        if (first.ok) {
+          proxyServer = first.server
+          return `http://127.0.0.1:${first.port}/v1`
+        }
+        if (first.code === "EADDRINUSE" && (await probeProxy(PROXY_PORT))) {
+          return `http://127.0.0.1:${PROXY_PORT}/v1` // 真有一个活着的实例
+        }
+        const fallback = await listenOn(0) // 端口被死进程占着 → 随机端口
+        if (!fallback.ok) return ""
+        proxyServer = fallback.server
+        return `http://127.0.0.1:${fallback.port}/v1`
+      })()
+      return proxyReady
+      }
 
 export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
   const log = (message) => {
