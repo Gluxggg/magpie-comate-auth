@@ -64,9 +64,14 @@ magpie ──OpenAI 格式──▶ 127.0.0.1:3427（插件内）──▶ zulu 
 插件里固定传 `HTTP_HOST=https://comate.baidu.com`。
 
 **多轮怎么处理的（跟其它 CLI 反代一个思路）**：不重发历史。
-zulu 有 `-c <conversationId>` 会话续跑，插件拿「上一轮自己返回的 assistant 文本」做指纹
-（客户端下一轮必然把它带回来），索引到那次会话的 id，于是**只把最后一句增量发过去**，
-历史留在服务端。实测两轮：6.1s → 4.1s，第二轮只发一句仍记得住上文。
+zulu 有 `-c <conversationId>` 会话续跑。认会话的优先级是：
+
+1. 客户端显式给的会话标识：`prompt_cache_key`，或 `x-session-id` / `x-conversation-id` / `x-thread-id` 头；
+2. 没有就退回指纹：拿「上一轮自己返回的 assistant 文本」做 hash（客户端下一轮必然把它带回来）。
+
+命中后**只把最后一句增量发过去**，历史留在服务端。实测两轮：5.8s → 4.5s，第二轮只发一句仍记得住上文。
+
+> 刻意**不用** OpenAI 的 `user` 字段当会话 key —— 它是用户身份，拿它当会话会把同一用户的不同对话串成一条。
 
 **图片**：OpenAI 的 `image_url`（data URL）会落成临时文件，走 `--attach-image` 传给 zulu，
 用完即删。实测能正确识别图形与图上文字。

@@ -434,7 +434,13 @@ function textOf(m) {
   return ""
 }
 
-function findCid(messages) {
+function findCid(messages, sessionKey) {
+  // ① 客户端如果给了明确的会话标识（header / prompt_cache_key），优先用它
+  if (sessionKey) {
+    const cid = REPLY_INDEX.get("k:" + sessionKey)
+    if (cid) return cid
+  }
+  // ② 兜底：上一轮我返回的 assistant 文本，客户端这一轮必然带回来
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i]?.role !== "assistant") continue
     const cid = REPLY_INDEX.get(quickHash(textOf(messages[i])))
@@ -443,9 +449,25 @@ function findCid(messages) {
   return ""
 }
 
-function rememberReply(text, cid) {
+// 只认「明确是会话」的标识。不用 OpenAI 的 `user` 字段——那是用户身份，
+// 拿它当会话 key 会把同一用户的不同对话串成一条。
+function explicitSession(body, headers) {
+  const cands = [
+    body?.prompt_cache_key,
+    headers?.["x-session-id"],
+    headers?.["x-conversation-id"],
+    headers?.["x-thread-id"],
+  ]
+  for (const v of cands) {
+    if (typeof v === "string" && v.trim()) return v.trim()
+  }
+  return ""
+}
+
+function rememberReply(text, cid, sessionKey) {
   if (!text || !cid) return
   REPLY_INDEX.set(quickHash(text), cid)
+  if (sessionKey) REPLY_INDEX.set("k:" + sessionKey, cid)
   while (REPLY_INDEX.size > REPLY_LIMIT) REPLY_INDEX.delete(REPLY_INDEX.keys().next().value)
 }
 
@@ -510,7 +532,8 @@ function startProxy() {
         const lastUser = [...msgs].reverse().find((m) => m?.role === "user")
         const images = extractImages(lastUser)
         // 续会话只发最后一句（历史在 zulu 那边），新会话才把 system + 历史拼成一条
-        const cid = findCid(msgs)
+        const sessionKey = explicitSession(body, req.headers)
+        const cid = findCid(msgs, sessionKey)
         const query = cid && lastUser ? textOf(lastUser) : toQuery(msgs)
         if (!query) {
           dropImages(images)
@@ -518,7 +541,7 @@ function startProxy() {
         }
         try {
           const { text, cid: newCid } = await runZulu(query, model.label, { cid, images })
-          rememberReply(text, newCid)
+          rememberReply(text, newCid, sessionKey)
           dropImages(images)
           const id = "chatcmpl-" + Date.now().toString(36)
           const created = Math.floor(Date.now() / 1000)
