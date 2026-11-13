@@ -10,7 +10,7 @@
 //
 // 本插件只读 magpie 的凭据：不写 magpie 的配置，只写一份用量缓存（comate-usage-cache.json）。
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs"
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
 import { dirname, join, resolve } from "node:path"
@@ -341,21 +341,20 @@ function toQuery(messages) {
   return parts.join("\n\n")
 }
 
-function runZulu(query, modelLabel, timeoutMs = 240000) {
+function runZulu(query, modelLabel, { cid, images = [], timeoutMs = 240000 } = {}) {
   return new Promise((resolvePromise, reject) => {
     const cli = zuluCli()
     if (!existsSync(cli)) {
       return reject(new Error("zulu CLI 没装：node_modules/@comate/zulu 不存在，先在插件目录 npm i @comate/zulu"))
     }
-    const child = spawn(
-      findNode(),
-      [cli, "run", "-q", query, "-m", modelLabel, "--mode", "Ask", "-d", "delta-stream"],
-      {
-        env: { ...process.env, HTTP_HOST: BASE },
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    )
+    const args = [cli, "run", "-q", query, "-m", modelLabel, "--mode", "Ask", "-d", "delta-stream"]
+    if (cid) args.push("-c", cid) // 复用会话：只发增量，服务端自己有历史
+    for (const img of images) args.push("--attach-image", img)
+    const child = spawn(findNode(), args, {
+      env: { ...process.env, HTTP_HOST: BASE },
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
     let out = ""
     let err = ""
     let done = false
@@ -383,19 +382,22 @@ function runZulu(query, modelLabel, timeoutMs = 240000) {
       let content = ""
       let status = ""
       let lastErr = ""
+      let gotCid = ""
       for (const line of out.split("\n")) {
         const s = line.trim()
         if (!s.startsWith("{")) continue
         try {
           const j = JSON.parse(s)
+          if (j.cid) gotCid = j.cid
           if (j.kind === "element-add" && j.element?.type === "EXCEPTION") lastErr = j.element.content ?? ""
           if (j.kind === "completed") {
             content = j.content ?? ""
             status = j.status ?? ""
+            if (j.cid) gotCid = j.cid
           }
         } catch {}
       }
-      if (status === "ok") resolvePromise(content)
+      if (status === "ok") resolvePromise({ text: content, cid: gotCid })
       else reject(new Error(content || lastErr || err.trim() || "zulu 没有返回内容"))
     })
   })
@@ -413,6 +415,73 @@ function readJsonBody(req) {
       }
     })
   })
+}
+
+// ── 多轮：OpenAI 客户端每次都把全量历史发过来，但 zulu 自己有会话，只该收增量。
+// 认「这是同一个会话」的办法：上一轮我返回的 assistant 文本，这一轮必然出现在 messages 里。
+const REPLY_INDEX = new Map() // hash(assistant 文本) → conversationId
+const REPLY_LIMIT = 300
+
+function quickHash(s) {
+  let h = 0
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
+  return String(h)
+}
+
+function textOf(m) {
+  if (typeof m?.content === "string") return m.content
+  if (Array.isArray(m?.content)) return m.content.map((c) => c?.text ?? "").join("")
+  return ""
+}
+
+function findCid(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== "assistant") continue
+    const cid = REPLY_INDEX.get(quickHash(textOf(messages[i])))
+    if (cid) return cid
+  }
+  return ""
+}
+
+function rememberReply(text, cid) {
+  if (!text || !cid) return
+  REPLY_INDEX.set(quickHash(text), cid)
+  while (REPLY_INDEX.size > REPLY_LIMIT) REPLY_INDEX.delete(REPLY_INDEX.keys().next().value)
+}
+
+// 图片：OpenAI 传的是 data URL，zulu 要文件路径，落一份临时文件，用完就删。
+function imageDir() {
+  const d = join(selfDir(), ".tmp")
+  try {
+    mkdirSync(d, { recursive: true })
+  } catch {}
+  return d
+}
+
+function extractImages(message) {
+  const out = []
+  if (!Array.isArray(message?.content)) return out
+  for (const part of message.content) {
+    if (part?.type !== "image_url") continue
+    const url = part?.image_url?.url ?? ""
+    const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/s.exec(url)
+    if (!m) continue
+    const ext = m[1] === "jpeg" ? "jpg" : m[1].replace(/[^a-z0-9]/gi, "") || "png"
+    const file = join(imageDir(), `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`)
+    try {
+      writeFileSync(file, Buffer.from(m[2], "base64"))
+      out.push(file)
+    } catch {}
+  }
+  return out
+}
+
+function dropImages(files) {
+  for (const f of files) {
+    try {
+      unlinkSync(f)
+    } catch {}
+  }
 }
 
 // 起本地 OpenAI 兼容口。端口固定，已被占用就认为别的 magpie 进程已经在服务了。
@@ -437,10 +506,20 @@ function startProxy() {
       if (url.pathname.endsWith("/chat/completions") && req.method === "POST") {
         const body = await readJsonBody(req)
         const model = modelOf(body.model)
-        const query = toQuery(body.messages)
-        if (!query) return send(400, { error: { message: "messages 是空的", type: "invalid_request_error" } })
+        const msgs = Array.isArray(body.messages) ? body.messages : []
+        const lastUser = [...msgs].reverse().find((m) => m?.role === "user")
+        const images = extractImages(lastUser)
+        // 续会话只发最后一句（历史在 zulu 那边），新会话才把 system + 历史拼成一条
+        const cid = findCid(msgs)
+        const query = cid && lastUser ? textOf(lastUser) : toQuery(msgs)
+        if (!query) {
+          dropImages(images)
+          return send(400, { error: { message: "messages 是空的", type: "invalid_request_error" } })
+        }
         try {
-          const text = await runZulu(query, model.label)
+          const { text, cid: newCid } = await runZulu(query, model.label, { cid, images })
+          rememberReply(text, newCid)
+          dropImages(images)
           const id = "chatcmpl-" + Date.now().toString(36)
           const created = Math.floor(Date.now() / 1000)
           if (body.stream) {
@@ -471,6 +550,7 @@ function startProxy() {
             usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
           })
         } catch (e) {
+          dropImages(images)
           return send(502, { error: { message: String(e?.message ?? e), type: "upstream_error" } })
         }
       }
