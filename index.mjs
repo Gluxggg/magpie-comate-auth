@@ -380,7 +380,7 @@ async function uploadImage(license, filePath) {
 }
 
 // 一轮对话：建会话（或复用）→ 建任务 → execute；边收 SSE 边把增量交给 onDelta。
-async function callComate({ question, history, model, conversationId, images = [], toolResults = [], onDelta, timeoutMs = 300000 }) {
+async function callComate({ question, history, model, conversationId, images = [], toolResults = [], wantTools = false, onDelta, timeoutMs = 300000 }) {
   const auth = readMagpieCookies()
   if (!auth?.cookies?.length) throw new Error("没有百度 cookie：先 `magpie plugin login comate` 登录一次")
   const license = await getLicense(buildCookieHeader(auth.cookies))
@@ -411,15 +411,17 @@ async function callComate({ question, history, model, conversationId, images = [
 
   let cid = conversationId
   if (!cid) {
-    const conv = await apiPost(license, "/api/aidevops/autocomate/rest/autowork/v2/conversation", { agentId: 1, ...base })
+    const conv = await apiPost(license, "/api/aidevops/autocomate/rest/autowork/v2/conversation", { agentId: wantTools ? 1 : 8, ...base })
     cid = conv?.data?.id
     if (!cid) throw new Error(`建会话失败：${JSON.stringify(conv).slice(0, 200)}`)
   }
 
   const taskId = (
     await apiPost(license, "/api/aidevops/autocomate/rest/autowork/v2/task", {
-      agentInfo: { agentName: "Agent", isProjectAgent: false, canInvokeAgents: true, isCustomAgent: false },
-      agentId: 1,
+      agentInfo: wantTools
+        ? { agentName: "Agent", isProjectAgent: false, canInvokeAgents: true, isCustomAgent: false }
+        : { agentName: "Ask", isProjectAgent: false, canInvokeAgents: false, isCustomAgent: false },
+      agentId: wantTools ? 1 : 8,
       conversationId: cid,
       signal: {},
       ...base,
@@ -435,7 +437,7 @@ async function callComate({ question, history, model, conversationId, images = [
       ...base,
       taskId,
       conversationId: cid,
-      agentId: 1,
+      agentId: wantTools ? 1 : 8,
       uploadBaseInfo: {
         os: "Windows 10",
         osVersion: "Windows 10",
@@ -479,11 +481,15 @@ async function callComate({ question, history, model, conversationId, images = [
       agentVersion: 12,
       isFirstQuery: !conversationId && !toolResults.length,
       enableMemory: true,
-      systemReminder: "",
+      systemReminder: wantTools
+        ? ""
+        : "<system-reminder>\nYou are a plain chat assistant. No tools are available in this session.\nDo NOT emit function calls. Answer with text only.\n</system-reminder>",
       extendUserQueryInfo: { commands: [], skills: [], subagents: [], rules: [] },
       extend: { isMultiWorkspace: false, useWorkflow: false },
       sendMode: "normal",
-      agentInfo: { agentName: "Agent", isProjectAgent: false, canInvokeAgents: true, isCustomAgent: false },
+      agentInfo: wantTools
+        ? { agentName: "Agent", isProjectAgent: false, canInvokeAgents: true, isCustomAgent: false }
+        : { agentName: "Ask", isProjectAgent: false, canInvokeAgents: false, isCustomAgent: false },
     }),
     signal: AbortSignal.timeout(timeoutMs),
   })
@@ -541,10 +547,15 @@ async function callComate({ question, history, model, conversationId, images = [
       }
     }
   }
-  const toolCalls = [...pending.entries()].map(([id, v]) => {
-    rememberToolCall(id, v.name, v.args) // Comate 原始 name/params，回传结果时要原样还回去
-    return { id, name: TOOL_TO_OPENAI[v.name] ?? v.name, arguments: v.args }
-  })
+  // 只把 Hermes 认识的工具交出去：Comate 的 Skill / Glob 这类没有对应实现，
+  // 原样透传会让客户端报 "Model generated invalid tool call: Skill"。
+  const toolCalls = [...pending.entries()]
+    .map(([id, v]) => {
+      rememberToolCall(id, v.name, v.args) // Comate 原始 name/params，回传结果时要原样还回去
+      const mapped = TOOL_TO_OPENAI[v.name]
+      return mapped ? { id, name: mapped, arguments: v.args } : null
+    })
+    .filter(Boolean)
   if (err && !text && !toolCalls.length) throw new Error(err)
   return { text, cid, toolCalls }
 }
@@ -726,18 +737,6 @@ function rememberToolCall(id, name, params) {
 // 只能靠 tool_call_id 找回上一轮的会话，否则 Comate 会当成新对话、重复调工具。
 const TOOL_CALL_CID = new Map()
 
-// 会话映射：显式 session key → conversationId
-const SESSION_CIDS = new Map()
-const SESSION_LIMIT = 300
-
-function rememberSession(key, cid) {
-  if (!key || !cid) return
-  SESSION_CIDS.set(key, cid)
-  if (SESSION_CIDS.size > SESSION_LIMIT) {
-    const first = SESSION_CIDS.keys().next().value
-    SESSION_CIDS.delete(first)
-  }
-}
 
 const sseChunk = (id, model, delta, finish = null) =>
   `data: ${JSON.stringify({
@@ -769,6 +768,7 @@ async function handleChat(init) {
       }
     })
 
+  const wantTools = Array.isArray(body.tools) && body.tools.length > 0
   const lastUser = [...msgs].reverse().find((m) => m?.role === "user")
   const question = textOf(lastUser).trim()
   if (!question && !toolResults.length) {
@@ -780,7 +780,7 @@ async function handleChat(init) {
 
   const sessionKey = String(body.prompt_cache_key ?? init?.headers?.["x-session-id"] ?? "")
   const toolMsgId = msgs.find((m) => m?.role === "tool")?.tool_call_id
-  const cid = (sessionKey && SESSION_CIDS.get(sessionKey)) || (toolMsgId && TOOL_CALL_CID.get(toolMsgId)) || ""
+  const cid = (toolMsgId && TOOL_CALL_CID.get(toolMsgId)) || findCid(msgs, sessionKey) || ""
   const images = extractImages(lastUser)
   const id = "chatcmpl-" + Date.now().toString(36)
 
@@ -801,9 +801,10 @@ async function handleChat(init) {
             conversationId: cid,
             images,
             toolResults,
+            wantTools,
             onDelta: (d) => push(sseChunk(id, model.id, { content: d })),
           })
-          rememberSession(sessionKey, out.cid)
+          rememberReply(out.text, out.cid, sessionKey)
           for (const tc of out.toolCalls) if (out.cid) TOOL_CALL_CID.set(tc.id, out.cid)
           if (out.toolCalls.length) {
             out.toolCalls.forEach((tc, i) => {
@@ -838,9 +839,9 @@ async function handleChat(init) {
   }
 
   try {
-    const out = await callComate({ question, model, conversationId: cid, images, toolResults })
+    const out = await callComate({ question, model, conversationId: cid, images, toolResults, wantTools })
     dropImages(images)
-    rememberSession(sessionKey, out.cid)
+    rememberReply(out.text, out.cid, sessionKey)
     for (const tc of out.toolCalls) if (out.cid) TOOL_CALL_CID.set(tc.id, out.cid)
     const message = out.toolCalls.length
       ? {
