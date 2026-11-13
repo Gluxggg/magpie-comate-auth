@@ -262,7 +262,6 @@ const pluginIcon = await loadIcon()
 // 关键坑：zulu 的 API_MAP 里没有 SAAS 平台，默认掉到内网域名 comate.baidu-int.com；
 // 必须显式 HTTP_HOST=https://comate.baidu.com，否则报 ENOTFOUND / TLS 断开。
 
-const PROXY_PORT = Number(process.env.COMATE_PROXY_PORT ?? 3427)
 
 // modelId 是 Comate 服务端认的完整 key（<type>_<hash>），从 `zulu list-model` 取一次，
 // 会随服务端版本变；对不上时用 modelType 前缀兜底，再不行就报错让用户重跑 list-model。
@@ -286,18 +285,22 @@ const MODELS = [
 
 const modelOf = (name) => MODELS.find((m) => m.id === name || m.label === name) ?? MODELS[0]
 
-function modelEntry(m, baseURL) {
+function modelEntry(m) {
   return [
     m.id,
     {
       id: m.id,
       name: m.label,
-      provider: { npm: "@ai-sdk/openai-compatible", ...(baseURL ? { api: baseURL } : {}) },
+      // api.id 是发给上游的 model id（Comate 认的 <type>_<hash>），和展示用的 id 不同
+      api: { id: m.modelId, npm: "@ai-sdk/openai-compatible" },
       limit: { context: 128000, output: 8192 },
-      reasoning: true,
-      tool_call: false,
-      attachment: !!m.vision,
-      modalities: { input: m.vision ? ["text", "image"] : ["text"], output: ["text"] },
+      capabilities: {
+        reasoning: true,
+        toolcall: true,
+        attachment: !!m.vision,
+        input: { text: true, image: !!m.vision },
+      },
+      ...(m.effort ? { variants: Object.fromEntries(m.effort.map((e) => [e, {}])) } : {}),
     },
   ]
 }
@@ -377,7 +380,7 @@ async function uploadImage(license, filePath) {
 }
 
 // 一轮对话：建会话（或复用）→ 建任务 → execute；边收 SSE 边把增量交给 onDelta。
-async function callComate({ question, history, model, conversationId, images = [], onDelta, timeoutMs = 300000 }) {
+async function callComate({ question, history, model, conversationId, images = [], toolResults = [], onDelta, timeoutMs = 300000 }) {
   const auth = readMagpieCookies()
   if (!auth?.cookies?.length) throw new Error("没有百度 cookie：先 `magpie plugin login comate` 登录一次")
   const license = await getLicense(buildCookieHeader(auth.cookies))
@@ -408,15 +411,15 @@ async function callComate({ question, history, model, conversationId, images = [
 
   let cid = conversationId
   if (!cid) {
-    const conv = await apiPost(license, "/api/aidevops/autocomate/rest/autowork/v2/conversation", { agentId: 8, ...base })
+    const conv = await apiPost(license, "/api/aidevops/autocomate/rest/autowork/v2/conversation", { agentId: 1, ...base })
     cid = conv?.data?.id
     if (!cid) throw new Error(`建会话失败：${JSON.stringify(conv).slice(0, 200)}`)
   }
 
   const taskId = (
     await apiPost(license, "/api/aidevops/autocomate/rest/autowork/v2/task", {
-      agentInfo: { isProjectAgent: false, agentName: "Ask", canInvokeAgents: false },
-      agentId: 8,
+      agentInfo: { agentName: "Agent", isProjectAgent: false, canInvokeAgents: true, isCustomAgent: false },
+      agentId: 1,
       conversationId: cid,
       signal: {},
       ...base,
@@ -432,7 +435,7 @@ async function callComate({ question, history, model, conversationId, images = [
       ...base,
       taskId,
       conversationId: cid,
-      agentId: 8,
+      agentId: 1,
       uploadBaseInfo: {
         os: "Windows 10",
         osVersion: "Windows 10",
@@ -451,7 +454,7 @@ async function callComate({ question, history, model, conversationId, images = [
       },
       query,
       modelKey: model.modelId,
-      toolUseResults: [],
+      toolUseResults: toolResults,
       contexts,
       subAgents: [],
       sysInfo: {
@@ -468,17 +471,19 @@ async function callComate({ question, history, model, conversationId, images = [
       isUserQuery: true,
       isMockQuery: false,
       localIndex: false,
-      // 下面这几个字段看着没用，缺了模型会返回空内容——都是 zulu 真实请求里带的，
-      // 尤其 systemReminder 是 Ask 模式的系统提示，空了模型就不知道该干什么。
+      // 下面这几个字段看着没用，缺了模型会返回空内容——都是 zulu 真实请求里带的。
+      // systemReminder 尤其关键：原来照抄 zulu 的「Ask mode / read-only tools」，
+      // 模型会去发 FUNCTION_CALL（调 grep/read_file 之类），而这边不实现工具循环，
+      // 于是只收到一堆工具调用、拿不到最终文本 → 表现为「回复空白」。
+      // 所以这里显式声明「没有工具、只回文本」，把 agent 循环彻底掐掉。
       agentVersion: 12,
-      isFirstQuery: !conversationId,
+      isFirstQuery: !conversationId && !toolResults.length,
       enableMemory: true,
-      systemReminder:
-        "<system-reminder>\nAsk mode is active; only read-only tools are available.\nIf code edits are needed, output the proposed change as assistant text for the user to copy/apply.\n</system-reminder>",
+      systemReminder: "",
       extendUserQueryInfo: { commands: [], skills: [], subagents: [], rules: [] },
       extend: { isMultiWorkspace: false, useWorkflow: false },
       sendMode: "normal",
-      agentInfo: { agentName: "Ask", isProjectAgent: false, canInvokeAgents: false, isCustomAgent: false },
+      agentInfo: { agentName: "Agent", isProjectAgent: false, canInvokeAgents: true, isCustomAgent: false },
     }),
     signal: AbortSignal.timeout(timeoutMs),
   })
@@ -489,6 +494,8 @@ async function callComate({ question, history, model, conversationId, images = [
   let buf = ""
   let text = ""
   let err = ""
+  // FUNCTION_CALL 的事件是增量快照，按 tool_use.id 累积最后一个非空 input
+  const pending = new Map()
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
@@ -515,10 +522,31 @@ async function callComate({ question, history, model, conversationId, images = [
           onDelta?.(d)
         }
       }
+      if (String(c.type).startsWith("FUNCTION_CALL")) {
+        for (const tu of c.detail?.toolUse ?? []) {
+          if (!tu?.id) continue
+          const cur = pending.get(tu.id) ?? { name: tu.name ?? "", args: {} }
+          if (tu.name) cur.name = tu.name
+          if (tu.input && Object.keys(tu.input).length) {
+            // Comate 的参数是增量片段（如 "package" 然后 ".json"），空串是收尾标记。
+            // 所以字符串拼接、空串跳过，其余类型直接覆盖。
+            for (const [k, v] of Object.entries(tu.input)) {
+              if (typeof v === "string" && v === "") continue
+              if (typeof v === "string" && typeof cur.args[k] === "string" && cur.args[k]) cur.args[k] += v
+              else cur.args[k] = v
+            }
+          }
+          pending.set(tu.id, cur)
+        }
+      }
     }
   }
-  if (err && !text) throw new Error(err)
-  return { text, cid }
+  const toolCalls = [...pending.entries()].map(([id, v]) => {
+    rememberToolCall(id, v.name, v.args) // Comate 原始 name/params，回传结果时要原样还回去
+    return { id, name: TOOL_TO_OPENAI[v.name] ?? v.name, arguments: v.args }
+  })
+  if (err && !text && !toolCalls.length) throw new Error(err)
+  return { text, cid, toolCalls }
 }
 
 // 把 OpenAI 的 messages 拼成 zulu 的单条 query。zulu 是 agent，不是多轮 chat API。
@@ -656,148 +684,194 @@ function dropImages(files) {
   }
 }
 
-// 起本地 OpenAI 兼容口。
-let proxyReady = null
-let proxyServer = null
+// ── 请求翻译：OpenAI chat completions ↔ Comate autowork ──────────
+// magpie 通过 auth.loader.fetch 把 OpenAI 格式请求交进来，这里翻译成 Comate 的 execute，
+// 再把结果翻回 OpenAI 格式（含 tool_calls）。工具由 agent（Hermes）执行，插件只做翻译。
 
-async function proxyHandler(req, res) {
-  const url = new URL(req.url ?? "/", "http://127.0.0.1")
-      const send = (code, body) => {
-        res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" })
-        res.end(JSON.stringify(body))
+// Comate 内置工具名 → OpenAI/Hermes 工具名
+const TOOL_TO_OPENAI = {
+  Glob: "search_files",
+  Grep: "search_files",
+  Read: "read_file",
+  Bash: "terminal",
+  Write: "write_file",
+  Edit: "patch",
+  WebSearch: "web_search",
+  WebFetch: "web_extract",
+  run_command: "terminal",
+  read_file: "read_file",
+  grep_content: "search_files",
+  glob_path: "search_files",
+  list_dir: "terminal",
+  web_search: "web_search",
+  web_fetch: "web_extract",
+  codebase_search: "search_files",
+  read_lints: "read_file",
+}
+
+// 记住每次工具调用的原始 name/params：Hermes 执行完只回 tool_call_id + content，
+// 但 Comate 的 toolUseResults 要求带 name 和 params，得从这里补。
+const TOOL_CALLS = new Map()
+const TOOL_CALLS_LIMIT = 500
+
+function rememberToolCall(id, name, params) {
+  TOOL_CALLS.set(id, { name, params })
+  if (TOOL_CALLS.size > TOOL_CALLS_LIMIT) {
+    const first = TOOL_CALLS.keys().next().value
+    TOOL_CALLS.delete(first)
+  }
+}
+
+// tool_call_id → conversationId：Hermes 回传工具结果时没有 session key，
+// 只能靠 tool_call_id 找回上一轮的会话，否则 Comate 会当成新对话、重复调工具。
+const TOOL_CALL_CID = new Map()
+
+// 会话映射：显式 session key → conversationId
+const SESSION_CIDS = new Map()
+const SESSION_LIMIT = 300
+
+function rememberSession(key, cid) {
+  if (!key || !cid) return
+  SESSION_CIDS.set(key, cid)
+  if (SESSION_CIDS.size > SESSION_LIMIT) {
+    const first = SESSION_CIDS.keys().next().value
+    SESSION_CIDS.delete(first)
+  }
+}
+
+const sseChunk = (id, model, delta, finish = null) =>
+  `data: ${JSON.stringify({
+    id,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  })}\n\n`
+
+// loader.fetch：magpie 把 OpenAI 格式请求交进来
+async function handleChat(init) {
+  const raw = typeof init?.body === "string" ? init.body : new TextDecoder().decode(init?.body ?? "")
+  const body = JSON.parse(raw || "{}")
+  const model = MODELS.find((m) => m.id === body.model || m.modelId === body.model) ?? MODELS[0]
+  const msgs = Array.isArray(body.messages) ? body.messages : []
+
+  // Hermes 执行完工具后回传的 role:"tool" 消息 → Comate 的 toolUseResults
+  const toolResults = msgs
+    .filter((m) => m?.role === "tool")
+    .map((m) => {
+      const known = TOOL_CALLS.get(m.tool_call_id) ?? {}
+      return {
+        id: m.tool_call_id,
+        name: known.name ?? "run_command",
+        success: true,
+        params: known.params ?? {},
+        message: String(m.content ?? ""),
       }
+    })
 
-      if (url.pathname.endsWith("/models") && req.method === "GET") {
-        return send(200, {
-          object: "list",
-          data: MODELS.map((m) => ({ id: m.id, object: "model", owned_by: PROVIDER_ID })),
-        })
-      }
+  const lastUser = [...msgs].reverse().find((m) => m?.role === "user")
+  const question = textOf(lastUser).trim()
+  if (!question && !toolResults.length) {
+    return new Response(JSON.stringify({ error: { message: "messages 是空的", type: "invalid_request_error" } }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    })
+  }
 
-      if (url.pathname.endsWith("/chat/completions") && req.method === "POST") {
-        const body = await readJsonBody(req)
-        const model = modelOf(body.model)
-        const msgs = Array.isArray(body.messages) ? body.messages : []
-        const lastUser = [...msgs].reverse().find((m) => m?.role === "user")
-        const images = extractImages(lastUser)
-        // 续会话只发最后一句（历史在 zulu 那边），新会话才把 system + 历史拼成一条
-        const sessionKey = explicitSession(body, req.headers)
-        const cid = findCid(msgs, sessionKey)
-        // 续会话只发最后一句（历史在服务端）；新会话把历史带上，长的话 runZulu 会转成附件
-        const { question, history } = splitQuery(msgs)
-        const askQuestion = cid ? (lastUser ? textOf(lastUser).trim() : question) : question
-        const askHistory = cid ? "" : history
-        if (!askQuestion && !askHistory) {
-          dropImages(images)
-          return send(400, { error: { message: "messages 是空的", type: "invalid_request_error" } })
+  const sessionKey = String(body.prompt_cache_key ?? init?.headers?.["x-session-id"] ?? "")
+  const toolMsgId = msgs.find((m) => m?.role === "tool")?.tool_call_id
+  const cid = (sessionKey && SESSION_CIDS.get(sessionKey)) || (toolMsgId && TOOL_CALL_CID.get(toolMsgId)) || ""
+  const images = extractImages(lastUser)
+  const id = "chatcmpl-" + Date.now().toString(36)
+
+  if (body.stream) {
+    const stream = new ReadableStream({
+      async start(controller) {
+        const enc = new TextEncoder()
+        const push = (x) => {
+          try {
+            controller.enqueue(enc.encode(x))
+          } catch {}
         }
-        const id = "chatcmpl-" + Date.now().toString(36)
-        const created = Math.floor(Date.now() / 1000)
-        const chunk = (delta, finish = null) =>
-          `data: ${JSON.stringify({
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model: model.id,
-            choices: [{ index: 0, delta, finish_reason: finish }],
-          })}\n\n`
         try {
-          if (body.stream) {
-            res.writeHead(200, {
-              "Content-Type": "text/event-stream; charset=utf-8",
-              "Cache-Control": "no-store",
-              Connection: "keep-alive",
-            })
-            res.write(chunk({ role: "assistant" }))
-            const { text, cid: newCid } = await callComate({
-              question: askQuestion,
-              history: askHistory,
-              model,
-              conversationId: cid,
-              images,
-              onDelta: (d) => res.write(chunk({ content: d })),
-            })
-            rememberReply(text, newCid, sessionKey)
-            dropImages(images)
-            res.write(chunk({}, "stop"))
-            res.write("data: [DONE]\n\n")
-            return res.end()
-          }
-          const { text, cid: newCid } = await callComate({
-            question: askQuestion,
-            history: askHistory,
+          push(sseChunk(id, model.id, { role: "assistant" }))
+          const out = await callComate({
+            question,
             model,
             conversationId: cid,
             images,
+            toolResults,
+            onDelta: (d) => push(sseChunk(id, model.id, { content: d })),
           })
-          rememberReply(text, newCid, sessionKey)
-          dropImages(images)
-          return send(200, {
-            id,
-            object: "chat.completion",
-            created,
-            model: model.id,
-            choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          })
-        } catch (e) {
-          dropImages(images)
-          const msg = String(e?.message ?? e)
-          // 流式已经发过头了，只能把错误塞进流里，不能再改状态码
-          if (res.headersSent) {
-            try {
-              res.write(chunk({}, "stop"))
-              res.write(`data: ${JSON.stringify({ error: { message: msg, type: "upstream_error" } })}\n\n`)
-              res.write("data: [DONE]\n\n")
-              return res.end()
-            } catch {}
-            return
+          rememberSession(sessionKey, out.cid)
+          for (const tc of out.toolCalls) if (out.cid) TOOL_CALL_CID.set(tc.id, out.cid)
+          if (out.toolCalls.length) {
+            out.toolCalls.forEach((tc, i) => {
+              push(
+                sseChunk(id, model.id, {
+                  tool_calls: [
+                    { index: i, id: tc.id, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.arguments) } },
+                  ],
+                }),
+              )
+            })
+            push(sseChunk(id, model.id, {}, "tool_calls"))
+          } else {
+            push(sseChunk(id, model.id, {}, "stop"))
           }
-          return send(502, { error: { message: msg, type: "upstream_error" } })
+          push("data: [DONE]\n\n")
+        } catch (e) {
+          push(`data: ${JSON.stringify({ error: { message: String(e?.message ?? e), type: "upstream_error" } })}\n\n`)
+          push("data: [DONE]\n\n")
+        } finally {
+          dropImages(images)
+          try {
+            controller.close()
+          } catch {}
         }
-      }
+      },
+    })
+    return new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" },
+    })
+  }
 
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
-      res.end("not found")
-      }
-
-      // 端口被占时不能盲目认定「已有实例在服务」：旧进程可能刚退出、端口已空，
-      // 那样 magpie 会一直 ECONNREFUSED。先探测，探不通就换随机端口。
-      function listenOn(port) {
-      return new Promise((resolve) => {
-        const server = createServer(proxyHandler)
-        server.once("error", (e) => resolve({ ok: false, code: e?.code }))
-        server.listen(port, "127.0.0.1", () => resolve({ ok: true, port: server.address().port, server }))
-      })
-      }
-
-      async function probeProxy(port) {
-      try {
-        const r = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(1500) })
-        return r.ok
-      } catch {
-        return false
-      }
-      }
-
-      async function startProxy() {
-      if (proxyReady) return proxyReady
-      proxyReady = (async () => {
-        const first = await listenOn(PROXY_PORT)
-        if (first.ok) {
-          proxyServer = first.server
-          return `http://127.0.0.1:${first.port}/v1`
+  try {
+    const out = await callComate({ question, model, conversationId: cid, images, toolResults })
+    dropImages(images)
+    rememberSession(sessionKey, out.cid)
+    for (const tc of out.toolCalls) if (out.cid) TOOL_CALL_CID.set(tc.id, out.cid)
+    const message = out.toolCalls.length
+      ? {
+          role: "assistant",
+          content: out.text || null,
+          tool_calls: out.toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+          })),
         }
-        if (first.code === "EADDRINUSE" && (await probeProxy(PROXY_PORT))) {
-          return `http://127.0.0.1:${PROXY_PORT}/v1` // 真有一个活着的实例
-        }
-        const fallback = await listenOn(0) // 端口被死进程占着 → 随机端口
-        if (!fallback.ok) return ""
-        proxyServer = fallback.server
-        return `http://127.0.0.1:${fallback.port}/v1`
-      })()
-      return proxyReady
-      }
+      : { role: "assistant", content: out.text }
+    return new Response(
+      JSON.stringify({
+        id,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model.id,
+        choices: [{ index: 0, message, finish_reason: out.toolCalls.length ? "tool_calls" : "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      }),
+      { status: 200, headers: { "content-type": "application/json; charset=utf-8" } },
+    )
+  } catch (e) {
+    dropImages(images)
+    return new Response(JSON.stringify({ error: { message: String(e?.message ?? e), type: "upstream_error" } }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    })
+  }
+}
 
 export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
   const log = (message) => {
@@ -806,8 +880,6 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
     } catch {}
   }
   // 插件自己的 OpenAI 兼容口（起不来就只当额度卡片，不影响登录）
-  const localBase = await startProxy().catch(() => "")
-  if (localBase) log(`Comate: 模型通道在 ${localBase}`)
 
   const cookiesOf = (auth) => {
     if (auth?.type !== "oauth" || !Array.isArray(auth.cookies) || !auth.cookies.length) {
@@ -844,14 +916,12 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
     async config(cfg) {
       cfg.provider ??= {}
       const was = cfg.provider[PROVIDER_ID] ?? {}
-      const base = localBase || was.api
       cfg.provider[PROVIDER_ID] = {
         name: PROVIDER_NAME,
         npm: "@ai-sdk/openai-compatible",
-        ...(base ? { api: base } : {}),
         ...was,
         models: {
-          ...Object.fromEntries(MODELS.map((m) => modelEntry(m, base))),
+          ...Object.fromEntries(MODELS.map((m) => modelEntry(m))),
           ...(was.models ?? {}),
         },
       }
@@ -859,15 +929,22 @@ export const ComatePlugin = async ({ client, magpie } = {}, options = {}) => {
 
     provider: {
       id: PROVIDER_ID,
-      async models(provider) {
-        const base = localBase || provider?.api
-        return Object.fromEntries(MODELS.map((m) => modelEntry(m, base)))
+      async models() {
+        return Object.fromEntries(MODELS.map((m) => modelEntry(m)))
       },
     },
 
     auth: {
       provider: PROVIDER_ID,
       icon: pluginIcon,
+
+      // magpie 把每个 OpenAI 格式请求交给这个 fetch；插件只做翻译，工具由 agent 自己跑。
+      loader: () => ({
+        baseURL: BASE,
+        apiKey: "comate",
+        headers: { "X-Source": "COMATE", "x-skip-fcnap": "yes" },
+        fetch: (input, init) => handleChat(init),
+      }),
 
       // 登录态是两个 httpOnly cookie，没有 refresh 流。这里只在「复用本机」来源时
       // 跟着 magpie 里 DuMate 的登录态走：那边重登了，这边自动换新的。
