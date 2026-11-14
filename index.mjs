@@ -583,11 +583,30 @@ async function callComate({ question, history, model, conversationId, images = [
     return { text, toolCalls, usage }
   }
 
+  // 输入特别大时，先直接带 needCompression 发一次：服务端本来就要压，等它回
+  // NeedCompressionException 再重试等于白跑一轮（实测 802K/953K 的请求因此多花 15~20 秒）。
+  // 估算只用来决定「先问压缩」，估低了还有下面的异常重试兜底。
+  const estimateTokens = (s) => {
+    const text = String(s ?? "")
+    let cjk = 0
+    for (const ch of text) {
+      const c = ch.codePointAt(0)
+      if ((c >= 0x2e80 && c <= 0x9fff) || (c >= 0xf900 && c <= 0xfaff) || (c >= 0x3000 && c <= 0x303f)) cjk++
+    }
+    return Math.round(cjk * 0.63 + (text.length - cjk) * 0.3)
+  }
+  const compressUpfront = estimateTokens(query) >= 700000
+
   let out
   try {
-    out = await executeOnce(false)
+    out = await executeOnce(compressUpfront)
   } catch (e) {
     if (!e?.compression) throw e
+    if (compressUpfront) {
+      throw new Error(
+        "Comate 上下文已超出可压缩范围（NeedCompressionException）：这次输入太大，压缩后仍装不下，请缩短单条输入或另开会话",
+      )
+    }
     // 官方 zulu 客户端的做法：带 needCompression=true 重发一次，让服务端先压缩历史再执行。
     try {
       out = await executeOnce(true)
